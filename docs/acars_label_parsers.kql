@@ -1,0 +1,195 @@
+// =====================================================================
+// Parsery KQL dla etykiet ACARS w acars_raw (Fabric Eventhouse ACARSEH)
+// Wszystkie zweryfikowane na realnych danych 2026-07-24.
+// Wzorzec bazowy: acars_raw | extend m = Payload.msghtml | extend text = tostring(m.text), label = tostring(m.label)
+// =====================================================================
+
+// ---------------------------------------------------------------------
+// A9 — Deliver ATIS Information (pełny tekst ATIS)
+// ---------------------------------------------------------------------
+acars_raw
+| extend m = Payload.msghtml
+| where tostring(m.label) == 'A9'
+| extend text = tostring(m.text), tail = tostring(m.tail)
+| extend wind_dir  = extract(@'WIND (\d+)', 1, text)
+| extend wind_kt   = extract(@'WIND \d+ (\d+) KT', 1, text)
+| extend vis_km    = extract(@'VIS (\d+)\s*KM', 1, text)
+| extend qnh       = extract(@'QNH\s*(\d+)', 1, text)
+| extend temp_c    = extract(@'\bT\s*(-?\d+)', 1, text)
+| extend dewpoint_c= extract(@'DP\s*(-?\d+)', 1, text)
+| extend atis_code = extract(@'END OF (?:ATIS|\w+ ARR|\w+ DEP) (\w+)', 1, text)
+| project ReceivedUtc, tail, text, wind_dir, wind_kt, vis_km, qnh, temp_c, dewpoint_c, atis_code
+
+// ---------------------------------------------------------------------
+// 21 — Takeoff Data Calculation / Flight Plan free text
+// ---------------------------------------------------------------------
+acars_raw
+| extend m = Payload.msghtml
+| where tostring(m.label) == '21'
+| extend text = tostring(m.text), tail = tostring(m.tail)
+| extend plan_id = extract(@'FLIGHT PLAN (\S+)', 1, text)
+| extend dep     = extract(@'\((\w+) - (\w+)\)', 1, text)
+| extend arr     = extract(@'\((\w+) - (\w+)\)', 2, text)
+| extend tail_txt= extract(@'FOR TAIL (\w+)', 1, text)
+| project ReceivedUtc, tail, text, plan_id, dep, arr, tail_txt
+
+// ---------------------------------------------------------------------
+// 17 (NW Position/Weather) i 49 (Status Reports) — wspólny wzorzec
+// Format: SS EEEE FFFFFF/DDHHMMAAAABBBB\r\n<dane liczbowe>
+// SS=seq, EEEE=event code (TOIC/ICCL/DCAP/FLRO/ROTI/TISD/SDPO...), FFFFFF=flight, AAAA/BBBB=ICAO dep/arr
+// ---------------------------------------------------------------------
+acars_raw
+| extend m = Payload.msghtml
+| extend text = tostring(m.text), label = tostring(m.label), tail = tostring(m.tail)
+| where label in ('17','49') and text startswith '0'
+| extend seq         = extract(@'^(\d{2})', 1, text)
+| extend event_code  = extract(@'^\d{2}(\S{4})', 1, text)        // TOIC=Take-Off/In-Climb, ICCL=In-Climb, DCAP=Descent/Cap, FLRO/ROTI/TISD/SDPO=waypoints
+| extend flight_code = extract(@'^\d{2}\S{4}\s*(\S+)\s*/', 1, text)
+| extend day_time    = extract(@'/(\d{6})', 1, text)             // DDHHMM
+| extend dep         = extract(@'/\d{6}([A-Z]{4})', 1, text)
+| extend arr         = extract(@'/\d{6}[A-Z]{4}([A-Z]{4})', 1, text)
+| extend data_line   = extract(@'\r\n(.+)$', 1, text)             // druga linia: kurs/prędkość/temperatura (surowa, format wg linii)
+| project ReceivedUtc, label, tail, text, seq, event_code, flight_code, day_time, dep, arr, data_line
+
+// ---------------------------------------------------------------------
+// QQ/QP/QR/QS — klasyczne raporty OOOI (OFF/OUT/ON/IN)
+// Format: <ICAO dep><ICAO arr><HHMM>[<dodatkowe dane>]
+// ---------------------------------------------------------------------
+acars_raw
+| extend m = Payload.msghtml
+| extend text = tostring(m.text), label = tostring(m.label), tail = tostring(m.tail), flight = tostring(m.flight)
+| where label in ('QQ','QP','QR','QS')
+| extend event_name = case(label=='QQ','OFF', label=='QP','OUT', label=='QR','ON', label=='QS','IN', label)
+| extend dep  = extract(@'^([A-Z]{4})', 1, text)
+| extend arr  = extract(@'^[A-Z]{4}([A-Z]{4})', 1, text)
+| extend time_hhmm = extract(@'^[A-Z]{4}[A-Z]{4}(\d{4})', 1, text)
+| extend extra = extract(@'^[A-Z]{4}[A-Z]{4}\d{4}(.*)$', 1, text)  // dodatkowe pole np. fuel/dystans, różne wg etykiety
+| project ReceivedUtc, flight, tail, label, event_name, text, dep, arr, time_hhmm, extra
+
+// ---------------------------------------------------------------------
+// 83 — Airline Defined (CSV: dep,arr,datetime,lat,lon,dist,heading,speed,altitude)
+// ---------------------------------------------------------------------
+acars_raw
+| extend m = Payload.msghtml
+| where tostring(m.label) == '83'
+| extend text = tostring(m.text), tail = tostring(m.tail)
+| extend parts = split(text, ',')
+| extend dep          = trim(' ', tostring(parts[0]))
+| extend arr          = trim(' ', tostring(parts[1]))
+| extend datetime_str = trim(' ', tostring(parts[2]))   // DDHHMM
+| extend lat          = todouble(trim(' ', tostring(parts[3])))
+| extend lon          = todouble(trim(' ', tostring(parts[4])))
+| extend dist_nm      = toint(trim(' ', tostring(parts[5])))
+| extend heading      = toint(trim(' ', tostring(parts[6])))
+| extend speed_kt     = todouble(trim(' ', tostring(parts[7])))
+| extend altitude_ft  = toint(trim(' ', tostring(parts[8])))
+| project ReceivedUtc, tail, text, dep, arr, datetime_str, lat, lon, dist_nm, heading, speed_kt, altitude_ft
+
+// ---------------------------------------------------------------------
+// 16 — General Aviation Weather Request (CSV: time,alt,heading,speed,"N lat E lon")
+// UWAGA: format niespójny — część rekordów ma inny układ (POSA.../slash-delimited). Traktuj jako best-effort.
+// ---------------------------------------------------------------------
+acars_raw
+| extend m = Payload.msghtml
+| where tostring(m.label) == '16'
+| extend text = tostring(m.text), tail = tostring(m.tail)
+| extend parts = split(text, ',')
+| extend time_hhmmss = trim(' ', tostring(parts[0]))
+| extend val1        = trim(' ', tostring(parts[1]))
+| extend val2        = trim(' ', tostring(parts[2]))
+| extend val3        = trim(' ', tostring(parts[3]))
+| extend coords      = trim(' ', tostring(parts[4]))    // "N 52.545 E 20.794"
+| extend lat = extract(@'N\s*([\d.]+)', 1, coords)
+| extend lon = extract(@'E\s*([\d.]+)', 1, coords)
+| project ReceivedUtc, tail, text, time_hhmmss, val1, val2, val3, lat, lon
+
+// ---------------------------------------------------------------------
+// 38 — Unknown Message Label, ale ustrukturyzowany (slash-delimited position/perf report)
+// Format: /FLIGHT/DDMMYY/E lon/N lat/ALT/----/  /TEMP/DIST/HEADING/(druga linia)/HUMIDITY?/
+// ---------------------------------------------------------------------
+acars_raw
+| extend m = Payload.msghtml
+| where tostring(m.label) == '38'
+| extend text = tostring(m.text), tail = tostring(m.tail)
+| extend parts = split(text, '/')
+| extend flight_code = tostring(parts[1])
+| extend date_str    = tostring(parts[2])
+| extend lon         = tostring(parts[3])
+| extend lat         = tostring(parts[4])
+| extend altitude_ft = tostring(parts[5])
+| extend temp_field  = tostring(parts[8])
+| project ReceivedUtc, tail, text, flight_code, date_str, lon, lat, altitude_ft, temp_field
+
+// ---------------------------------------------------------------------
+// 8A / 8C / 8F — Airline Defined Out/On Report (CSV: HHMMSS,status,ICAO)
+// status: C=Closed/On, O=Open/Off (znaczenie zależne od kontekstu linii)
+// ---------------------------------------------------------------------
+acars_raw
+| extend m = Payload.msghtml
+| extend text = tostring(m.text), label = tostring(m.label), tail = tostring(m.tail), flight = tostring(m.flight)
+| where label in ('8A','8C','8F')
+| extend parts = split(text, ',')
+| extend time_hhmmss = tostring(parts[0])
+| extend status_flag = tostring(parts[1])
+| extend airport     = tostring(parts[2])
+| project ReceivedUtc, flight, tail, label, text, time_hhmmss, status_flag, airport
+
+// ---------------------------------------------------------------------
+// 5U — Downlink Weather Request ("SA <icao>[,<icao2>]")
+// ---------------------------------------------------------------------
+acars_raw
+| extend m = Payload.msghtml
+| where tostring(m.label) == '5U'
+| extend text = tostring(m.text), flight = tostring(m.flight)
+| extend airports = extract_all(@'([A-Z]{4})', text)
+| project ReceivedUtc, flight, text, airports
+
+// ---------------------------------------------------------------------
+// 12 / 13 / 14 / 22 — OFF/ON/INN/CMU raporty (event + flight + date/time + route)
+// Format: EVENT+SEQ + FLIGHT (padded) + / + DDHHMM + dep + arr + [dodatkowe dane w 2. linii]
+// ---------------------------------------------------------------------
+acars_raw
+| extend m = Payload.msghtml
+| extend text = tostring(m.text), label = tostring(m.label), tail = tostring(m.tail)
+| where label in ('12','13','14','22')
+| extend event_code  = extract(@'^([A-Z]{2,3})\d{2}', 1, text)
+| extend flight_code = extract(@'^[A-Z]{2,3}\d{2}\s*(\S+)\s*/', 1, text)
+| extend day_time    = extract(@'/(\d{6,8})', 1, text)
+| extend route       = extract(@'/\d{6,8}([A-Z]{8})', 1, text)
+| project ReceivedUtc, label, tail, text, event_code, flight_code, day_time, route
+
+// ---------------------------------------------------------------------
+// RA / RB — Command/Response (harmonogramy lotów, METAR/TREND) — swobodny tekst wieloliniowy
+// Parsowanie linia-po-linii (mklist) dla tabel lotów
+// ---------------------------------------------------------------------
+acars_raw
+| extend m = Payload.msghtml
+| where tostring(m.label) in ('RA','RB')
+| extend text = tostring(m.text), tail = tostring(m.tail)
+| extend lines = split(text, '\r\n')
+| mv-expand line = lines to typeof(string)
+| where isnotempty(trim(' ', line))
+| extend flight_line = extract(@'^([A-Z0-9]{4,7})\s+(\w{3})\s+(\d{3,4})', 0, line)
+| project ReceivedUtc, tail, original_text = text, line
+
+// ---------------------------------------------------------------------
+// QP/QQ/QR/QS oraz H1 — pozycja/nawigacja (najliczniejsza, format POS...)
+// Ten wariant obsługuje tylko podtyp zaczynający się od "POS"
+// Format: POS + lat/lon + ,waypoint,eta,FL,waypoint,eta,waypoint,code,num,num
+// ---------------------------------------------------------------------
+acars_raw
+| extend m = Payload.msghtml
+| where tostring(m.label) == 'H1'
+| extend text = tostring(m.text), tail = tostring(m.tail), flight = tostring(m.flight)
+| where text startswith 'POS'
+| extend latlon = extract(@'^POS(N?\d+[EW]\d+)', 1, text)
+| extend rest_parts = split(extract(@'^POS[NSEW\d]+,(.*)$', 1, text), ',')
+| extend next_wpt   = tostring(rest_parts[0])
+| extend eta1       = tostring(rest_parts[1])
+| extend flight_lvl = tostring(rest_parts[2])
+| extend next_wpt2  = tostring(rest_parts[3])
+| extend eta2       = tostring(rest_parts[4])
+| project ReceivedUtc, flight, tail, text, latlon, next_wpt, eta1, flight_lvl, next_wpt2, eta2
+// UWAGA: H1 ma WYSOKĄ wariancję formatu (są też surowe binarne fragmenty CMU/loadsheet
+// bez struktury POS...). Dla pełnego pokrycia trzeba dodać osobne gałęzie wg prefiksu tekstu
+// (case/switch po pierwszych znakach: "POS", cyfry+przecinki, puste, binarne).
